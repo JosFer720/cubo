@@ -1,0 +1,38 @@
+# === Rust / Cargo ===
+# Archivos y carpetas de compilación
+/target/
+
+# Archivos de dependencias y lock (si usas lib y bin al mismo tiempo puedes decidir)
+/Cargo.lock
+
+# === IDEs / Editores ===
+# VSCode
+.vscode/
+*.code-workspace
+
+# IntelliJ / CLion / RustRover
+.idea/
+
+# Archivos temporales de editores
+*~
+*.swp
+*.swo
+*.bak
+
+# === Archivos del sistema ===
+.DS_Store
+Thumbs.db
+
+# === Otros ===
+# Archivos de logs
+*.log
+
+# Archivos generados por depuración
+*.dSYM/
+*.pdb
+*.dll
+*.exe
+*.out
+
+# === Opcional (si generas documentación localmente con cargo doc) ===
+/target/doc/
