@@ -1,11 +1,56 @@
 use minifb::{Key, Window, WindowOptions};
 use nalgebra::{Point3, Vector3, Matrix3};
+use image::{DynamicImage, ImageBuffer, Rgb};
 
 const WIDTH: usize = 800;
 const HEIGHT: usize = 600;
 
+pub struct Texture {
+    pub image: ImageBuffer<Rgb<u8>, Vec<u8>>,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Texture {
+    fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
+        let img = image::open(path)?;
+        let rgb_img = img.to_rgb8();
+        let (width, height) = rgb_img.dimensions();
+        
+        Ok(Texture {
+            image: rgb_img,
+            width,
+            height,
+        })
+    }
+    
+    fn sample(&self, u: f32, v: f32) -> (f32, f32, f32) {
+        let x = ((u * self.width as f32) as u32).min(self.width - 1);
+        let y = ((v * self.height as f32) as u32).min(self.height - 1);
+        
+        let pixel = self.image.get_pixel(x, y);
+        (
+            pixel[0] as f32 / 255.0,
+            pixel[1] as f32 / 255.0,
+            pixel[2] as f32 / 255.0,
+        )
+    }
+}
+
 pub trait RayIntersect {
-    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>)>;
+    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>, Point2<f32>)>;
+}
+
+#[derive(Clone, Copy)]
+pub struct Point2<T> {
+    pub x: T,
+    pub y: T,
+}
+
+impl<T> Point2<T> {
+    fn new(x: T, y: T) -> Self {
+        Point2 { x, y }
+    }
 }
 
 pub struct Cube {
@@ -22,10 +67,31 @@ impl Cube {
             rotation: Matrix3::identity(),
         }
     }
+    
+    fn get_uv(&self, hit_point: &Point3<f32>, normal: &Vector3<f32>) -> Point2<f32> {
+        let local_hit = hit_point - self.center;
+        let half_size = self.size / 2.0;
+        
+        let u;
+        let v;
+        
+        if normal.x.abs() > normal.y.abs() && normal.x.abs() > normal.z.abs() {
+            u = (local_hit.z + half_size) / self.size;
+            v = (local_hit.y + half_size) / self.size;
+        } else if normal.y.abs() > normal.z.abs() {
+            u = (local_hit.x + half_size) / self.size;
+            v = (local_hit.z + half_size) / self.size;
+        } else {
+            u = (local_hit.x + half_size) / self.size;
+            v = (local_hit.y + half_size) / self.size;
+        }
+        
+        Point2::new(u.fract().abs(), v.fract().abs())
+    }
 }
 
 impl RayIntersect for Cube {
-    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>)> {
+    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>, Point2<f32>)> {
         let inv_rotation = self.rotation.transpose();
         let local_origin = self.center + inv_rotation * (ray_origin - self.center);
         let local_direction = inv_rotation * ray_direction;
@@ -72,7 +138,10 @@ impl RayIntersect for Cube {
         }
         
         let world_normal = self.rotation * normal;
-        Some((t_min, world_normal.normalize()))
+        let hit_point = ray_origin + ray_direction * t_min;
+        let uv = self.get_uv(&hit_point, &world_normal);
+        
+        Some((t_min, world_normal.normalize(), uv))
     }
 }
 
@@ -82,13 +151,15 @@ pub struct Plane {
 }
 
 impl RayIntersect for Plane {
-    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>)> {
+    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>, Point2<f32>)> {
         let denom = self.normal.dot(ray_direction);
         
         if denom.abs() > 1e-6 {
             let t = (self.point - ray_origin).dot(&self.normal) / denom;
             if t >= 0.001 {
-                return Some((t, self.normal));
+                let hit_point = ray_origin + ray_direction * t;
+                let uv = Point2::new(hit_point.x, hit_point.z);
+                return Some((t, self.normal, uv));
             }
         }
         None
@@ -102,7 +173,7 @@ fn is_in_shadow(point: &Point3<f32>, light_pos: &Point3<f32>, cube: &Cube) -> bo
     
     let shadow_origin = point + Vector3::new(0.0, 0.001, 0.0);
     
-    if let Some((t, _)) = cube.ray_intersect(&shadow_origin, &light_dir) {
+    if let Some((t, _, _)) = cube.ray_intersect(&shadow_origin, &light_dir) {
         if t > 0.0 && t < distance_to_light {
             return true;
         }
@@ -110,47 +181,58 @@ fn is_in_shadow(point: &Point3<f32>, light_pos: &Point3<f32>, cube: &Cube) -> bo
     false
 }
 
-pub fn cast_ray(ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>, cube: &Cube, plane: &Plane, light_pos: &Point3<f32>) -> u32 {
+pub fn cast_ray(
+    ray_origin: &Point3<f32>, 
+    ray_direction: &Vector3<f32>, 
+    cube: &Cube, 
+    plane: &Plane, 
+    light_pos: &Point3<f32>,
+    sand_texture: &Texture
+) -> u32 {
     let mut closest_t = f32::INFINITY;
     let mut hit_normal = Vector3::new(0.0, 0.0, 0.0);
     let mut hit_object = 0;
+    let mut hit_uv = Point2::new(0.0, 0.0);
     
-    if let Some((t, normal)) = cube.ray_intersect(ray_origin, ray_direction) {
+    if let Some((t, normal, uv)) = cube.ray_intersect(ray_origin, ray_direction) {
         if t < closest_t {
             closest_t = t;
             hit_normal = normal;
             hit_object = 1;
+            hit_uv = uv;
         }
     }
     
-    if let Some((t, normal)) = plane.ray_intersect(ray_origin, ray_direction) {
+    if let Some((t, normal, uv)) = plane.ray_intersect(ray_origin, ray_direction) {
         if t < closest_t {
             closest_t = t;
             hit_normal = normal;
             hit_object = 2;
+            hit_uv = uv;
         }
     }
     
     match hit_object {
         1 => {
+            // CUBO CON TEXTURA DE ARENA
             let hit_point = ray_origin + ray_direction * closest_t;
             let light_dir = (light_pos - hit_point).normalize();
             
             let diffuse = hit_normal.dot(&light_dir).max(0.0);
-            let ambient = 0.2;
-            let intensity = (ambient + diffuse * 0.8).min(1.0);
+            let ambient = 0.3;
+            let intensity = (ambient + diffuse * 0.7).min(1.0);
             
-            let base_r = 0.3;
-            let base_g = 0.7;
-            let base_b = 0.9;
+            // Obtener color de la textura de arena
+            let (tex_r, tex_g, tex_b) = sand_texture.sample(hit_uv.x, hit_uv.y);
             
-            let r = (base_r * intensity * 255.0) as u32;
-            let g = (base_g * intensity * 255.0) as u32;
-            let b = (base_b * intensity * 255.0) as u32;
+            let r = (tex_r * intensity * 255.0) as u32;
+            let g = (tex_g * intensity * 255.0) as u32;
+            let b = (tex_b * intensity * 255.0) as u32;
             
             0xFF000000 | (r.min(255) << 16) | (g.min(255) << 8) | b.min(255)
         },
         2 => {
+            // PLANO CON PATRÓN DE TABLERO
             let hit_point = ray_origin + ray_direction * closest_t;
             
             let in_shadow = is_in_shadow(&hit_point, light_pos, cube);
@@ -195,11 +277,14 @@ struct Scene {
     light_pos: Point3<f32>,
     camera_pos: Point3<f32>,
     camera_target: Point3<f32>,
+    sand_texture: Texture,
 }
 
 impl Scene {
-    fn new() -> Self {
-        Scene {
+    fn new() -> Result<Self, Box<dyn std::error::Error>> {
+        let sand_texture = Texture::load("textures/sand.png")?;
+        
+        Ok(Scene {
             cube: Cube::new(Point3::new(0.0, 1.0, 0.0), 2.0),
             plane: Plane {
                 point: Point3::new(0.0, 0.0, 0.0),
@@ -208,7 +293,8 @@ impl Scene {
             light_pos: Point3::new(-3.0, 8.0, -3.0),
             camera_pos: Point3::new(5.0, 8.0, 5.0),
             camera_target: Point3::new(0.0, 0.0, 0.0),
-        }
+            sand_texture,
+        })
     }
     
     fn move_camera(&mut self, delta: Vector3<f32>) {
@@ -230,7 +316,14 @@ impl Scene {
                 
                 let ray_direction = (forward + right * x + up * y).normalize();
                 
-                buffer[j * WIDTH + i] = cast_ray(&self.camera_pos, &ray_direction, &self.cube, &self.plane, &self.light_pos);
+                buffer[j * WIDTH + i] = cast_ray(
+                    &self.camera_pos, 
+                    &ray_direction, 
+                    &self.cube, 
+                    &self.plane, 
+                    &self.light_pos,
+                    &self.sand_texture
+                );
             }
         }
     }
@@ -240,7 +333,7 @@ fn main() {
     let mut buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
     
     let mut window = Window::new(
-        "Cubo",
+        "Cubo con Textura de Arena",
         WIDTH,
         HEIGHT,
         WindowOptions::default(),
@@ -250,13 +343,14 @@ fn main() {
     
     window.set_target_fps(60);
     
-    let mut scene = Scene::new();
-    let move_speed = 0.2;
+    let mut scene = Scene::new().expect("Error cargando la textura de arena");
+    let move_speed = 0.5;
     
     println!("==== CONTROLES ====");
     println!("A/S/W/D - Mover cámara");
     println!("Q/E - Subir/bajar cámara");
     println!("ESC - Salir");
+    println!("Textura cargada: textures/sand.png");
     
     while window.is_open() && !window.is_key_down(Key::Escape) {
         if window.is_key_down(Key::A) {
