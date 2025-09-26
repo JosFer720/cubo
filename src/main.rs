@@ -1,304 +1,387 @@
 use minifb::{Key, Window, WindowOptions};
-use nalgebra::{Point3, Vector3, Matrix3};
-use image::{DynamicImage, ImageBuffer, Rgb};
+use nalgebra::{Point3, Vector3};
+use rayon::prelude::*;
+use std::fs;
 
-const WIDTH: usize = 800;
-const HEIGHT: usize = 600;
+const WIDTH: usize = 600;
+const HEIGHT: usize = 450;
 
-pub struct Texture {
-    pub image: ImageBuffer<Rgb<u8>, Vec<u8>>,
-    pub width: u32,
-    pub height: u32,
+// Definición de tipos de bloques
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+pub enum BlockType {
+    Aire = 0,
+    TerracotaNaranja = 1,    // n
+    Netherrack = 2,          // i
+    BloqueMagma = 3,         // l
+    TerracotaNormal = 4,     // t
+    TerracotaAmarilla = 5,   // a
+    ObsidianaNormal = 6,     // o
+    Lava = 7,                // p
+    BloqueOro = 8,           // y
+    Cofre = 9,               // c
+    EscaleraPiedra = 10,     // e
+    SlabPiedra = 11,         // s
+    CryingObsidian = 12,     // k
 }
 
-impl Texture {
-    fn load(path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        let img = image::open(path)?;
-        let rgb_img = img.to_rgb8();
-        let (width, height) = rgb_img.dimensions();
-        
-        Ok(Texture {
-            image: rgb_img,
-            width,
-            height,
-        })
-    }
-    
-    fn sample(&self, u: f32, v: f32) -> (f32, f32, f32) {
-        let x = ((u * self.width as f32) as u32).min(self.width - 1);
-        let y = ((v * self.height as f32) as u32).min(self.height - 1);
-        
-        let pixel = self.image.get_pixel(x, y);
-        (
-            pixel[0] as f32 / 255.0,
-            pixel[1] as f32 / 255.0,
-            pixel[2] as f32 / 255.0,
-        )
-    }
-}
+// Arrays estáticos para lookup rápido
+static BLOCK_COLORS: [(f32, f32, f32); 13] = [
+    (0.0, 0.0, 0.0),      // Aire
+    (0.8, 0.4, 0.1),      // Terracota naranja
+    (0.4, 0.2, 0.2),      // Netherrack
+    (0.9, 0.3, 0.1),      // Bloque magma
+    (0.6, 0.4, 0.3),      // Terracota normal
+    (0.9, 0.8, 0.2),      // Terracota amarilla
+    (0.1, 0.1, 0.2),      // Obsidiana
+    (1.0, 0.5, 0.0),      // Lava
+    (1.0, 0.8, 0.0),      // Oro
+    (0.5, 0.3, 0.2),      // Cofre
+    (0.5, 0.5, 0.5),      // Escalera piedra
+    (0.6, 0.6, 0.6),      // Slab piedra
+    (0.3, 0.1, 0.4),      // Crying obsidian
+];
 
-pub trait RayIntersect {
-    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>, Point2<f32>)>;
-}
+static EMISSIVE_BLOCKS: [bool; 13] = [
+    false, false, false, true,  // 0-3 (magma emite luz)
+    false, false, false, true,  // 4-7 (lava emite luz)
+    false, false, false, false, false, // 8-12
+];
 
-#[derive(Clone, Copy)]
-pub struct Point2<T> {
-    pub x: T,
-    pub y: T,
-}
-
-impl<T> Point2<T> {
-    fn new(x: T, y: T) -> Self {
-        Point2 { x, y }
-    }
-}
-
-pub struct Cube {
-    pub center: Point3<f32>,
-    pub size: f32,
-    pub rotation: Matrix3<f32>,
-}
-
-impl Cube {
-    fn new(center: Point3<f32>, size: f32) -> Self {
-        Cube {
-            center,
-            size,
-            rotation: Matrix3::identity(),
+impl BlockType {
+    #[inline]
+    fn from_char(c: char) -> Self {
+        match c {
+            'n' => BlockType::TerracotaNaranja,
+            'i' => BlockType::Netherrack,
+            'l' => BlockType::BloqueMagma,
+            't' => BlockType::TerracotaNormal,
+            'a' => BlockType::TerracotaAmarilla,
+            'o' => BlockType::ObsidianaNormal,
+            'p' => BlockType::Lava,
+            'y' => BlockType::BloqueOro,
+            'c' => BlockType::Cofre,
+            'e' => BlockType::EscaleraPiedra,
+            's' => BlockType::SlabPiedra,
+            'k' => BlockType::CryingObsidian,
+            ' ' => BlockType::Aire,  // Espacio en blanco = aire
+            _ => BlockType::Aire,
         }
     }
     
-    fn get_uv(&self, hit_point: &Point3<f32>, normal: &Vector3<f32>) -> Point2<f32> {
-        let local_hit = hit_point - self.center;
-        let half_size = self.size / 2.0;
-        
-        let u;
-        let v;
-        
-        if normal.x.abs() > normal.y.abs() && normal.x.abs() > normal.z.abs() {
-            u = (local_hit.z + half_size) / self.size;
-            v = (local_hit.y + half_size) / self.size;
-        } else if normal.y.abs() > normal.z.abs() {
-            u = (local_hit.x + half_size) / self.size;
-            v = (local_hit.z + half_size) / self.size;
-        } else {
-            u = (local_hit.x + half_size) / self.size;
-            v = (local_hit.y + half_size) / self.size;
-        }
-        
-        Point2::new(u.fract().abs(), v.fract().abs())
+    #[inline]
+    fn get_color(self) -> (f32, f32, f32) {
+        BLOCK_COLORS[self as usize]
+    }
+    
+    #[inline]
+    fn is_solid(self) -> bool {
+        self != BlockType::Aire
+    }
+    
+    #[inline]
+    fn emits_light(self) -> bool {
+        EMISSIVE_BLOCKS[self as usize]
+    }
+    
+    #[inline]
+    fn is_slab(self) -> bool {
+        self == BlockType::SlabPiedra
+    }
+    
+    #[inline]
+    fn is_stairs(self) -> bool {
+        self == BlockType::EscaleraPiedra
     }
 }
 
-impl RayIntersect for Cube {
-    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>, Point2<f32>)> {
-        let inv_rotation = self.rotation.transpose();
-        let local_origin = self.center + inv_rotation * (ray_origin - self.center);
-        let local_direction = inv_rotation * ray_direction;
+pub struct VoxelWorld {
+    blocks: Vec<BlockType>,
+    width: usize,
+    height: usize,
+    depth: usize,
+}
+
+impl VoxelWorld {
+    fn new() -> Self {
+        VoxelWorld {
+            blocks: Vec::new(),
+            width: 0,
+            height: 0,
+            depth: 0,
+        }
+    }
+    
+    fn load_from_files(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut layers = Vec::new();
         
-        let half_size = self.size / 2.0;
-        let min = self.center - Vector3::new(half_size, half_size, half_size);
-        let max = self.center + Vector3::new(half_size, half_size, half_size);
+        // Cargar archivos desde la carpeta "capas"
+        for i in 0..12 {
+            let filename = format!("capas/{}.txt", i);
+            match fs::read_to_string(&filename) {
+                Ok(content) => {
+                    layers.push(content);
+                    println!("Cargado: {}", filename);
+                }
+                Err(_) => {
+                    println!("No se pudo cargar {}, usando capa vacía", filename);
+                    // Crear capa vacía de aire
+                    layers.push("               \n".repeat(19));
+                }
+            }
+        }
         
-        let mut t_min = f32::NEG_INFINITY;
-        let mut t_max = f32::INFINITY;
-        let mut normal = Vector3::new(0.0, 0.0, 0.0);
+        self.load_from_layer_data(&layers);
+        Ok(())
+    }
+    
+    fn load_from_layer_data(&mut self, layer_data: &[String]) {
+        if layer_data.is_empty() {
+            return;
+        }
         
-        for i in 0..3 {
-            if local_direction[i].abs() < 1e-6 {
-                if local_origin[i] < min[i] || local_origin[i] > max[i] {
-                    return None;
+        // Establecer dimensiones basadas en tus archivos
+        self.width = 15;  // 15 caracteres por línea
+        self.depth = 19;  // 19 líneas por archivo
+        self.height = layer_data.len(); // 12 capas
+        
+        self.blocks = vec![BlockType::Aire; self.width * self.height * self.depth];
+        
+        // Cargar cada capa (y=0 es la base, y=11 es la cima)
+        for (y, layer_str) in layer_data.iter().enumerate() {
+            let lines: Vec<&str> = layer_str.lines().collect();
+            for (z, line) in lines.iter().enumerate() {
+                if z < self.depth {
+                    // Asegurar que la línea tenga exactamente 15 caracteres
+                    let padded_line = format!("{:15}", line);
+                    for (x, ch) in padded_line.chars().take(self.width).enumerate() {
+                        let block_type = BlockType::from_char(ch);
+                        let index = y * (self.width * self.depth) + z * self.width + x;
+                        self.blocks[index] = block_type;
+                    }
+                }
+            }
+        }
+        
+        println!("Mundo cargado: {}x{}x{}", self.width, self.height, self.depth);
+        println!("Total de bloques: {}", self.blocks.len());
+    }
+    
+    #[inline]
+    fn get_block(&self, x: i32, y: i32, z: i32) -> BlockType {
+        if x < 0 || y < 0 || z < 0 || 
+           x >= self.width as i32 || y >= self.height as i32 || z >= self.depth as i32 {
+            return BlockType::Aire;
+        }
+        let index = y as usize * (self.width * self.depth) + z as usize * self.width + x as usize;
+        self.blocks[index]
+    }
+    
+    // Función para verificar colisión con formas especiales
+    fn check_special_collision(&self, x: i32, y: i32, z: i32, point: &Point3<f32>) -> bool {
+        let block = self.get_block(x, y, z);
+        
+        // Coordenadas locales dentro del bloque (0.0 a 1.0)
+        let local_x = point.x - x as f32;
+        let local_y = point.y - y as f32;
+        let local_z = point.z - z as f32;
+        
+        match block {
+            BlockType::SlabPiedra => {
+                // Slab ocupa solo la mitad inferior del bloque
+                local_y <= 0.5
+            },
+            BlockType::EscaleraPiedra => {
+                // Escalera simple: mitad inferior + escalón en una esquina
+                if local_y <= 0.5 {
+                    true  // Base de la escalera
+                } else if local_y <= 1.0 && local_z >= 0.5 {
+                    true  // Escalón superior
+                } else {
+                    false
+                }
+            },
+            _ => {
+                // Bloque completo
+                local_x >= 0.0 && local_x <= 1.0 && 
+                local_y >= 0.0 && local_y <= 1.0 && 
+                local_z >= 0.0 && local_z <= 1.0
+            }
+        }
+    }
+    
+    // DDA Algorithm optimizado para voxel traversal con formas especiales
+    fn raycast(&self, origin: &Point3<f32>, direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>, BlockType)> {
+        // Fast 3D DDA voxel traversal
+        let dir = *direction;
+        let max_distance = 100.0;
+
+        // Starting voxel
+        let mut x = origin.x.floor() as i32;
+        let mut y = origin.y.floor() as i32;
+        let mut z = origin.z.floor() as i32;
+
+        let step_x = if dir.x >= 0.0 { 1 } else { -1 };
+        let step_y = if dir.y >= 0.0 { 1 } else { -1 };
+        let step_z = if dir.z >= 0.0 { 1 } else { -1 };
+
+        let tx_delta = if dir.x.abs() < 1e-6 { f32::INFINITY } else { 1.0 / dir.x.abs() };
+        let ty_delta = if dir.y.abs() < 1e-6 { f32::INFINITY } else { 1.0 / dir.y.abs() };
+        let tz_delta = if dir.z.abs() < 1e-6 { f32::INFINITY } else { 1.0 / dir.z.abs() };
+
+        let mut tx = if dir.x > 0.0 {
+            (x as f32 + 1.0 - origin.x) / dir.x
+        } else if dir.x < 0.0 {
+            (origin.x - x as f32) / -dir.x
+        } else { f32::INFINITY };
+
+        let mut ty = if dir.y > 0.0 {
+            (y as f32 + 1.0 - origin.y) / dir.y
+        } else if dir.y < 0.0 {
+            (origin.y - y as f32) / -dir.y
+        } else { f32::INFINITY };
+
+        let mut tz = if dir.z > 0.0 {
+            (z as f32 + 1.0 - origin.z) / dir.z
+        } else if dir.z < 0.0 {
+            (origin.z - z as f32) / -dir.z
+        } else { f32::INFINITY };
+
+        let mut traveled = 0.0_f32;
+
+        loop {
+            if traveled > max_distance { break; }
+
+            // Check voxel
+            let block = self.get_block(x, y, z);
+            let hit_point = origin + dir * traveled.max(0.0);
+            if block.is_solid() && self.check_special_collision(x, y, z, &hit_point) {
+                let normal = self.calculate_normal(x, y, z, &hit_point);
+                return Some((traveled.max(0.0), normal, block));
+            }
+
+            // Step to next voxel boundary
+            if tx < ty {
+                if tx < tz {
+                    x += step_x;
+                    traveled = tx;
+                    tx += tx_delta;
+                } else {
+                    z += step_z;
+                    traveled = tz;
+                    tz += tz_delta;
                 }
             } else {
-                let t1 = (min[i] - local_origin[i]) / local_direction[i];
-                let t2 = (max[i] - local_origin[i]) / local_direction[i];
-                
-                let (t_near, t_far) = if t1 < t2 {
-                    (t1, t2)
+                if ty < tz {
+                    y += step_y;
+                    traveled = ty;
+                    ty += ty_delta;
                 } else {
-                    (t2, t1)
-                };
-                
-                if t_near > t_min {
-                    t_min = t_near;
-                    normal = Vector3::zeros();
-                    normal[i] = if local_direction[i] > 0.0 { -1.0 } else { 1.0 };
-                }
-                
-                t_max = t_max.min(t_far);
-                
-                if t_min > t_max {
-                    return None;
+                    z += step_z;
+                    traveled = tz;
+                    tz += tz_delta;
                 }
             }
-        }
-        
-        if t_min < 0.001 {
-            return None;
-        }
-        
-        let world_normal = self.rotation * normal;
-        let hit_point = ray_origin + ray_direction * t_min;
-        let uv = self.get_uv(&hit_point, &world_normal);
-        
-        Some((t_min, world_normal.normalize(), uv))
-    }
-}
 
-pub struct Plane {
-    pub point: Point3<f32>,
-    pub normal: Vector3<f32>,
-}
-
-impl RayIntersect for Plane {
-    fn ray_intersect(&self, ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>) -> Option<(f32, Vector3<f32>, Point2<f32>)> {
-        let denom = self.normal.dot(ray_direction);
-        
-        if denom.abs() > 1e-6 {
-            let t = (self.point - ray_origin).dot(&self.normal) / denom;
-            if t >= 0.001 {
-                let hit_point = ray_origin + ray_direction * t;
-                let uv = Point2::new(hit_point.x, hit_point.z);
-                return Some((t, self.normal, uv));
+            // Early out if we leave reasonable bounds
+            if x < -2 || y < -2 || z < -2 || x > self.width as i32 + 2 || y > self.height as i32 + 2 || z > self.depth as i32 + 2 {
+                break;
             }
         }
+
         None
     }
+    
+    fn calculate_normal(&self, x: i32, y: i32, z: i32, hit_point: &Point3<f32>) -> Vector3<f32> {
+        let block_center = Vector3::new(x as f32 + 0.5, y as f32 + 0.5, z as f32 + 0.5);
+        let to_hit = Vector3::new(hit_point.x, hit_point.y, hit_point.z) - block_center;
+        
+        // Determinar qué cara fue golpeada
+        let abs_x = to_hit.x.abs();
+        let abs_y = to_hit.y.abs();
+        let abs_z = to_hit.z.abs();
+        
+        if abs_x > abs_y && abs_x > abs_z {
+            Vector3::new(to_hit.x.signum(), 0.0, 0.0)
+        } else if abs_y > abs_z {
+            Vector3::new(0.0, to_hit.y.signum(), 0.0)
+        } else {
+            Vector3::new(0.0, 0.0, to_hit.z.signum())
+        }
+    }
 }
 
-fn is_in_shadow(point: &Point3<f32>, light_pos: &Point3<f32>, cube: &Cube) -> bool {
-    let to_light = light_pos - point;
-    let distance_to_light = to_light.magnitude();
-    let light_dir = to_light.normalize();
-    
-    let shadow_origin = point + Vector3::new(0.0, 0.001, 0.0);
-    
-    if let Some((t, _, _)) = cube.ray_intersect(&shadow_origin, &light_dir) {
-        if t > 0.0 && t < distance_to_light {
-            return true;
-        }
-    }
-    false
-}
-
-pub fn cast_ray(
-    ray_origin: &Point3<f32>, 
-    ray_direction: &Vector3<f32>, 
-    cube: &Cube, 
-    plane: &Plane, 
-    light_pos: &Point3<f32>,
-    sand_texture: &Texture
-) -> u32 {
-    let mut closest_t = f32::INFINITY;
-    let mut hit_normal = Vector3::new(0.0, 0.0, 0.0);
-    let mut hit_object = 0;
-    let mut hit_uv = Point2::new(0.0, 0.0);
-    
-    if let Some((t, normal, uv)) = cube.ray_intersect(ray_origin, ray_direction) {
-        if t < closest_t {
-            closest_t = t;
-            hit_normal = normal;
-            hit_object = 1;
-            hit_uv = uv;
-        }
-    }
-    
-    if let Some((t, normal, uv)) = plane.ray_intersect(ray_origin, ray_direction) {
-        if t < closest_t {
-            closest_t = t;
-            hit_normal = normal;
-            hit_object = 2;
-            hit_uv = uv;
-        }
-    }
-    
-    match hit_object {
-        1 => {
-            // CUBO CON TEXTURA DE ARENA
-            let hit_point = ray_origin + ray_direction * closest_t;
-            let light_dir = (light_pos - hit_point).normalize();
-            
-            let diffuse = hit_normal.dot(&light_dir).max(0.0);
-            let ambient = 0.3;
-            let intensity = (ambient + diffuse * 0.7).min(1.0);
-            
-            // Obtener color de la textura de arena
-            let (tex_r, tex_g, tex_b) = sand_texture.sample(hit_uv.x, hit_uv.y);
-            
-            let r = (tex_r * intensity * 255.0) as u32;
-            let g = (tex_g * intensity * 255.0) as u32;
-            let b = (tex_b * intensity * 255.0) as u32;
-            
-            0xFF000000 | (r.min(255) << 16) | (g.min(255) << 8) | b.min(255)
-        },
-        2 => {
-            // PLANO CON PATRÓN DE TABLERO
-            let hit_point = ray_origin + ray_direction * closest_t;
-            
-            let in_shadow = is_in_shadow(&hit_point, light_pos, cube);
-            
-            let scale = 2.0;
-            let checker = ((hit_point.x / scale).floor() as i32 + (hit_point.z / scale).floor() as i32) % 2 == 0;
-            
-            let base_color = if checker {
-                (0.8, 0.8, 0.8)
-            } else {
-                (0.3, 0.3, 0.3)
-            };
-            
-            let intensity = if in_shadow {
-                0.3
-            } else {
-                let light_dir = (light_pos - hit_point).normalize();
-                let diffuse = hit_normal.dot(&light_dir).max(0.0);
-                let ambient = 0.4;
-                (ambient + diffuse * 0.6).min(1.0)
-            };
-            
-            let r = (base_color.0 * intensity * 255.0) as u32;
-            let g = (base_color.1 * intensity * 255.0) as u32;
-            let b = (base_color.2 * intensity * 255.0) as u32;
-            
-            0xFF000000 | (r.min(255) << 16) | (g.min(255) << 8) | b.min(255)
-        },
-        _ => {
-            let gradient = (ray_direction.y + 0.5).max(0.0).min(1.0);
-            let r = (20.0 + gradient * 30.0) as u32;
-            let g = (25.0 + gradient * 35.0) as u32;
-            let b = (35.0 + gradient * 45.0) as u32;
-            0xFF000000 | (r << 16) | (g << 8) | b
-        }
+#[inline]
+pub fn cast_ray(ray_origin: &Point3<f32>, ray_direction: &Vector3<f32>, world: &VoxelWorld, light_pos: &Point3<f32>) -> u32 {
+    if let Some((t, normal, block_type)) = world.raycast(ray_origin, ray_direction) {
+        let hit_point = ray_origin + ray_direction * t;
+        let light_dir = (light_pos - hit_point).normalize();
+        
+        // Iluminación mejorada
+        let diffuse = normal.dot(&light_dir).max(0.0);
+        let ambient = if block_type.emits_light() { 0.9 } else { 0.3 };
+        let intensity = (ambient + diffuse * 0.7).min(1.0);
+        
+        let base_color = block_type.get_color();
+        let r = ((base_color.0 * intensity * 255.0) as u32).min(255);
+        let g = ((base_color.1 * intensity * 255.0) as u32).min(255);
+        let b = ((base_color.2 * intensity * 255.0) as u32).min(255);
+        
+        0xFF000000 | (r << 16) | (g << 8) | b
+    } else {
+        // Cielo degradado
+        let gradient = (ray_direction.y * 0.5 + 0.5).max(0.0).min(1.0);
+        let r = (135.0 + gradient * 120.0) as u32;  // Azul cielo
+        let g = (206.0 + gradient * 49.0) as u32;
+        let b = (235.0 + gradient * 20.0) as u32;
+        0xFF000000 | (r << 16) | (g << 8) | b
     }
 }
 
 struct Scene {
-    cube: Cube,
-    plane: Plane,
+    world: VoxelWorld,
     light_pos: Point3<f32>,
     camera_pos: Point3<f32>,
     camera_target: Point3<f32>,
-    sand_texture: Texture,
 }
 
 impl Scene {
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
-        let sand_texture = Texture::load("textures/sand.png")?;
+        let mut world = VoxelWorld::new();
+        world.load_from_files()?;
         
         Ok(Scene {
-            cube: Cube::new(Point3::new(0.0, 1.0, 0.0), 2.0),
-            plane: Plane {
-                point: Point3::new(0.0, 0.0, 0.0),
-                normal: Vector3::new(0.0, 1.0, 0.0),
-            },
-            light_pos: Point3::new(-3.0, 8.0, -3.0),
-            camera_pos: Point3::new(5.0, 8.0, 5.0),
-            camera_target: Point3::new(0.0, 0.0, 0.0),
-            sand_texture,
+            light_pos: Point3::new(7.5, 25.0, 7.5),
+            camera_pos: Point3::new(30.0, 20.0, 30.0),
+            camera_target: Point3::new(7.5, 8.0, 9.5),
+            world,
         })
     }
     
     fn move_camera(&mut self, delta: Vector3<f32>) {
         self.camera_pos += delta;
+    }
+    
+    fn rotate_camera(&mut self, yaw_delta: f32, pitch_delta: f32) {
+        let to_target = self.camera_target - self.camera_pos;
+        let distance = to_target.magnitude();
+        
+        // Calcular ángulos actuales
+        let current_yaw = to_target.z.atan2(to_target.x);
+        let current_pitch = (to_target.y / distance).asin();
+        
+        // Aplicar deltas
+        let new_yaw = current_yaw + yaw_delta;
+        let new_pitch = (current_pitch + pitch_delta).max(-1.5).min(1.5);
+        
+        // Calcular nueva posición del target
+        let new_direction = Vector3::new(
+            new_yaw.cos() * new_pitch.cos(),
+            new_pitch.sin(),
+            new_yaw.sin() * new_pitch.cos()
+        ) * distance;
+        
+        self.camera_target = self.camera_pos + new_direction;
     }
     
     fn render(&self, buffer: &mut Vec<u32>) {
@@ -309,50 +392,71 @@ impl Scene {
         let right = forward.cross(&Vector3::new(0.0, 1.0, 0.0)).normalize();
         let up = right.cross(&forward);
         
-        for j in 0..HEIGHT {
+        let tan_half_fov = (fov * 0.5).tan();
+
+        // Precompute X factors per column and Y factors per row to avoid recomputing division
+        let x_factors: Vec<f32> = (0..WIDTH).map(|i| {
+            (2.0 * (i as f32 + 0.5) / WIDTH as f32 - 1.0) * tan_half_fov * aspect_ratio
+        }).collect();
+        let y_factors: Vec<f32> = (0..HEIGHT).map(|j| {
+            -(2.0 * (j as f32 + 0.5) / HEIGHT as f32 - 1.0) * tan_half_fov
+        }).collect();
+
+        // Normalize camera basis once
+        let fwd = forward; // already normalized
+        let rgt = right; // already normalized
+        let upv = up; // orthogonal
+
+        // Parallelize over rows
+        buffer.par_chunks_mut(WIDTH).enumerate().for_each(|(j, row)| {
+            let y = y_factors[j];
             for i in 0..WIDTH {
-                let x = (2.0 * (i as f32 + 0.5) / WIDTH as f32 - 1.0) * (fov / 2.0).tan() * aspect_ratio;
-                let y = -(2.0 * (j as f32 + 0.5) / HEIGHT as f32 - 1.0) * (fov / 2.0).tan();
-                
-                let ray_direction = (forward + right * x + up * y).normalize();
-                
-                buffer[j * WIDTH + i] = cast_ray(
-                    &self.camera_pos, 
-                    &ray_direction, 
-                    &self.cube, 
-                    &self.plane, 
-                    &self.light_pos,
-                    &self.sand_texture
-                );
+                let x = x_factors[i];
+                let ray_dir = (fwd + rgt * x + upv * y).normalize();
+                row[i] = cast_ray(&self.camera_pos, &ray_dir, &self.world, &self.light_pos);
             }
-        }
+        });
     }
 }
 
-fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
     
     let mut window = Window::new(
-        "Cubo con Textura de Arena",
+        "Minecraft Raytracer - Tu Estructura",
         WIDTH,
         HEIGHT,
         WindowOptions::default(),
-    ).unwrap_or_else(|e| {
-        panic!("{}", e);
-    });
+    )?;
     
     window.set_target_fps(60);
     
-    let mut scene = Scene::new().expect("Error cargando la textura de arena");
-    let move_speed = 0.5;
+    let mut scene = Scene::new()?;
+    let move_speed = 1.0;
+    let rotation_speed = 0.05;
     
-    println!("==== CONTROLES ====");
-    println!("A/S/W/D - Mover cámara");
+    println!("==== MINECRAFT RAYTRACER ====");
+    println!("Estructura cargada desde carpeta 'capas/'");
+    println!("Dimensiones: 15x12x19 bloques");
+    
+    println!("\n==== CONTROLES ====");
+    println!("WASD - Mover cámara (adelante/atrás/izquierda/derecha)");
     println!("Q/E - Subir/bajar cámara");
+    println!("IJKL - Rotar cámara (I=arriba, K=abajo, J=izquierda, L=derecha)");
     println!("ESC - Salir");
-    println!("Textura cargada: textures/sand.png");
+    
+    println!("\n==== BLOQUES ESPECIALES ====");
+    println!("s = Slab (medio bloque)");
+    println!("e = Escalera");
+    println!("l = Magma (brilla)");
+    println!("p = Lava (brilla)");
+    println!("Espacio = Aire");
+    
+    let mut frame_count = 0;
+    let start_time = std::time::Instant::now();
     
     while window.is_open() && !window.is_key_down(Key::Escape) {
+        // Controles de movimiento simplificados
         if window.is_key_down(Key::A) {
             scene.move_camera(Vector3::new(-move_speed, 0.0, 0.0));
         }
@@ -372,7 +476,31 @@ fn main() {
             scene.move_camera(Vector3::new(0.0, -move_speed, 0.0));
         }
         
+        // Controles de rotación con IJKL
+        if window.is_key_down(Key::J) {
+            scene.rotate_camera(-rotation_speed, 0.0);
+        }
+        if window.is_key_down(Key::L) {
+            scene.rotate_camera(rotation_speed, 0.0);
+        }
+        if window.is_key_down(Key::I) {
+            scene.rotate_camera(0.0, rotation_speed);
+        }
+        if window.is_key_down(Key::K) {
+            scene.rotate_camera(0.0, -rotation_speed);
+        }
+        
         scene.render(&mut buffer);
-        window.update_with_buffer(&buffer, WIDTH, HEIGHT).unwrap();
+        window.update_with_buffer(&buffer, WIDTH, HEIGHT)?;
+        
+        frame_count += 1;
+        if frame_count % 60 == 0 {
+            let elapsed = start_time.elapsed().as_secs_f32();
+            let fps = frame_count as f32 / elapsed;
+            println!("FPS: {:.1} | Pos: ({:.1}, {:.1}, {:.1})", 
+                     fps, scene.camera_pos.x, scene.camera_pos.y, scene.camera_pos.z);
+        }
     }
+    
+    Ok(())
 }
