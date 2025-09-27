@@ -1,3 +1,18 @@
+/*
+Project: cubo (raytracer voxel)
+
+Breve descripción:
+Este archivo contiene el programa principal del raytracer por voxels. Implementa:
+- Carga de capas voxel desde archivos en `capas/`.
+- Un gestor sencillo de texturas que crea marcadores si faltan recursos.
+- Un trazador de rayos DDA robusto con un fallback por raymarching.
+- Un sombreador PBR simplificado con Fresnel, especular y reflexiones recursivas.
+- Un skybox procedimental día/noche con sol y estrellas.
+- Una cámara orbital con controles básicos para inspeccionar la escena.
+
+Nota: la documentación más específica para secciones concretas aparece junto a
+las implementaciones relevantes a lo largo del archivo.
+*/
 use minifb::{Key, Window, WindowOptions};
 use nalgebra::{Point3, Vector3};
 use image::{RgbImage, Rgb};
@@ -379,6 +394,15 @@ fn ray_aabb_intersect(orig: &Point3<f32>, dir: &Vector3<f32>, min: &Point3<f32>,
 
     Some((tmin, tmax))
 }
+
+/*
+Documentación (bloque):
+Sección: Helpers físicos y Fresnel
+Descripción: Funciones utilitarias usadas por el sombreado para calcular
+reflexiones y una aproximación de Fresnel (Schlick). Se mantienen simples
+pero son suficientes para el sombreado heurístico del trazador.
+*/
+
 
 pub struct VoxelWorld {
     blocks: Vec<BlockType>,
@@ -997,6 +1021,13 @@ pub struct Skybox {
 }
 
 impl Skybox {
+    /*
+    Documentación (bloque):
+    Sección: Skybox procedimental
+    Descripción: Genera un color de cielo en función de la dirección del rayo y
+    si es de día o de noche. Incluye contribución del sol (pico estrecho) y
+    estrellas generadas por una función hash para la noche.
+    */
     pub fn new(sun_dir: Vector3<f32>) -> Self {
         Skybox {
             day_horizon: Vector3::new(1.0, 0.6, 0.3),
@@ -1068,6 +1099,14 @@ struct Scene {
 }
 
 impl Scene {
+    /*
+    Documentación (bloque):
+    Sección: Scene / cámara
+    Descripción: Agrupa el `VoxelWorld`, las texturas, la posición de la luz y
+    los parámetros de la cámara orbital. Proporciona métodos para actualizar
+    la cámara desde parámetros de órbita y para renderizar la escena completa
+    en un buffer de píxeles usando paralelismo por filas (rayos independientes).
+    */
     fn new() -> Result<Self, Box<dyn std::error::Error>> {
         let mut world = VoxelWorld::new();
         world.load_from_files()?;
@@ -1178,6 +1217,13 @@ impl Scene {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /*
+    Documentación (bloque):
+    Sección: Punto de entrada
+    Descripción: Inicializa la ventana, carga el `Scene` (mundo + texturas) y
+    entra en el bucle principal de eventos. Procesa entrada del usuario para
+    controlar la cámara orbital y el modo día/noche, renderizando cada frame.
+    */
     let mut buffer: Vec<u32> = vec![0; WIDTH * HEIGHT];
 
     let mut window = Window::new(
