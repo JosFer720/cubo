@@ -9,6 +9,7 @@ nalgebra = "0.34"
 image = "0.25"  # Para cargar texturas
 rayon = "1.7"
 
+
 # Optimizaciones para mejor rendimiento
 [profile.dev]
 opt-level = 2  
